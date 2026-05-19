@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -781,6 +782,16 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, dashboardHTML, csrfToken, html.EscapeString(host), html.EscapeString(port))
 }
 
+func handleCsrf(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write([]byte(csrfToken))
+}
+
 func handleApprove(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -975,6 +986,55 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// dashboardHostnames is the set of hostnames acceptable in Host / Origin
+// headers on dashboard requests. Browser-side defense against DNS rebinding
+// (an attacker domain rebound to 127.0.0.1 still carries its original name
+// in the Host header) and against cross-origin POSTs.
+var dashboardHostnames = map[string]bool{
+	"127.0.0.1": true,
+	"localhost": true,
+	"::1":       true,
+}
+
+func extractHostname(hostport string) string {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]")
+	}
+	return strings.ToLower(host)
+}
+
+func hostnameAllowed(hostport string) bool {
+	return dashboardHostnames[extractHostname(hostport)]
+}
+
+// dashboardHostAllowed gates against DNS rebinding. A rebound attacker
+// domain still carries its original name in the Host header even when the
+// IP has been swapped to 127.0.0.1.
+func dashboardHostAllowed(r *http.Request) bool {
+	return r.Host != "" && hostnameAllowed(r.Host)
+}
+
+// dashboardOriginAllowed gates against cross-origin POSTs from a browser.
+// Browsers always set Origin on state-changing methods, so absent Origin
+// means a non-browser caller (e.g. bach itself), already constrained by
+// the local-arrival CIDR check.
+func dashboardOriginAllowed(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return hostnameAllowed(u.Host)
+}
+
 // dashboardAllowCIDRs is the set of local-interface CIDRs from which the
 // dashboard accepts connections. The check is against the LOCAL address the
 // TCP connection arrived on (i.e. which of the proxy's NICs received it), not
@@ -1099,6 +1159,7 @@ func main() {
 	dashMux := http.NewServeMux()
 	dashMux.HandleFunc("/", handleDashboard)
 	dashMux.HandleFunc("/events", handleSSE)
+	dashMux.HandleFunc("/csrf", handleCsrf)
 	dashMux.HandleFunc("/approve", handleApprove)
 	dashMux.HandleFunc("/revoke", handleRevoke)
 	dashMux.HandleFunc("/project", handleProjectUpsert)
@@ -1109,7 +1170,7 @@ func main() {
 	dashServer := &http.Server{
 		Addr: dashAddr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !dashboardAllowed(r) {
+			if !dashboardAllowed(r) || !dashboardHostAllowed(r) || !dashboardOriginAllowed(r) {
 				http.Error(w, "Forbidden", http.StatusForbidden)
 				return
 			}
@@ -1541,6 +1602,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
   var hosts = {};
   var tempExpiry = {};
+  var tempExpiryLoaded = false;
 
   var statusLabels = { allowed: "allowed", temp_allowed: "temp allowed", pending: "pending", rejected: "rejected", non_public_ip: "non-public ip", invalid_port: "invalid port", invalid_domain: "invalid domain" };
 
@@ -1560,6 +1622,10 @@ const dashboardHTML = `<!DOCTYPE html>
 
   function effectiveStatus(h) {
     if (h.pendingCount > 0) return "pending";
+    // Server temp-allows expire after a fixed window. If we've successfully
+    // loaded the temp-allow snapshot and this host isn't in it, the row is
+    // stale — demote so the action button flips back to "allow".
+    if (h.latestStatus === "temp_allowed" && tempExpiryLoaded && !tempExpiry[h.key]) return "rejected";
     return h.latestStatus === "pending" ? "rejected" : h.latestStatus;
   }
 
@@ -1616,12 +1682,6 @@ const dashboardHTML = `<!DOCTYPE html>
     return h;
   }
 
-  function bumpToBottom(h) {
-    if (tbody.lastChild !== h.tr) {
-      tbody.appendChild(h.tr);
-    }
-  }
-
   function handleEvent(ev) {
     var h = getOrCreate(ev.project || "?", ev.host);
     var ts = new Date(ev.timestamp).getTime();
@@ -1643,7 +1703,6 @@ const dashboardHTML = `<!DOCTYPE html>
       h.latestStatus = ev.status;
     }
 
-    bumpToBottom(h);
     renderRow(h);
     updateBadges();
   }
@@ -1671,18 +1730,24 @@ const dashboardHTML = `<!DOCTYPE html>
   }
   updateBadges();
 
-  function cleanup() {
+  function rerenderAll() {
     var cutoff = Date.now() - 600000;
     for (var k in hosts) {
       var h = hosts[k];
       while (h.timestamps.length > 0 && h.timestamps[0] < cutoff) {
         h.timestamps.shift();
       }
+      renderRow(h);
+    }
+    updateBadges();
+  }
+
+  function cull() {
+    for (var k in hosts) {
+      var h = hosts[k];
       if (h.timestamps.length === 0 && h.pendingCount === 0) {
         tbody.removeChild(h.tr);
         delete hosts[k];
-      } else {
-        renderRow(h);
       }
     }
     if (Object.keys(hosts).length === 0) {
@@ -1698,43 +1763,72 @@ const dashboardHTML = `<!DOCTYPE html>
         next[row.project + "|" + row.host] = row.expires_at;
       });
       tempExpiry = next;
+      tempExpiryLoaded = true;
     }).catch(function() {});
   }
   refreshTempAllows();
 
-  setInterval(function() { cleanup(); refreshTempAllows(); }, 1000);
+  setInterval(function() { rerenderAll(); refreshTempAllows(); }, 1000);
+  setInterval(cull, 60000);
+
+  // The proxy regenerates csrfToken on every process start, so a long-lived
+  // dashboard tab can find itself posting a stale token after the proxy is
+  // recreated (e.g. on image rebuild). Re-fetch and retry once on 403.
+  function postWithCsrfRetry(url) {
+    return fetch(url, { method: "POST", headers: { "X-CSRF-Token": csrfToken } }).then(function(resp) {
+      if (resp.status !== 403) return resp;
+      return fetch("/csrf").then(function(r) { return r.ok ? r.text() : null; }).then(function(t) {
+        if (!t || t === csrfToken) return resp;
+        csrfToken = t;
+        return fetch(url, { method: "POST", headers: { "X-CSRF-Token": csrfToken } });
+      });
+    });
+  }
 
   window.approveHost = function(project, host) {
     var key = rowKey(project, host);
-    fetch("/approve?project=" + encodeURIComponent(project) + "&host=" + encodeURIComponent(host), {
-      method: "POST",
-      headers: { "X-CSRF-Token": csrfToken }
-    }).then(function(resp) {
+    postWithCsrfRetry("/approve?project=" + encodeURIComponent(project) + "&host=" + encodeURIComponent(host)).then(function(resp) {
       if (resp.ok && hosts[key]) {
         hosts[key].latestStatus = "temp_allowed";
         renderRow(hosts[key]);
         updateBadges();
+      } else if (!resp.ok) {
+        console.warn("approve failed:", resp.status);
       }
     });
   };
 
   window.revokeHost = function(project, host) {
     var key = rowKey(project, host);
-    fetch("/revoke?project=" + encodeURIComponent(project) + "&host=" + encodeURIComponent(host), {
-      method: "POST",
-      headers: { "X-CSRF-Token": csrfToken }
-    }).then(function(resp) {
+    postWithCsrfRetry("/revoke?project=" + encodeURIComponent(project) + "&host=" + encodeURIComponent(host)).then(function(resp) {
       if (resp.ok && hosts[key]) {
         hosts[key].latestStatus = "rejected";
         renderRow(hosts[key]);
         updateBadges();
+      } else if (!resp.ok) {
+        console.warn("revoke failed:", resp.status);
       }
     });
   };
 
+  var sseHadError = false;
   var es = new EventSource("/events");
-  es.onopen = function() { liveEl.classList.remove("off"); };
-  es.onerror = function() { liveEl.classList.add("off"); };
+  es.onopen = function() {
+    liveEl.classList.remove("off");
+    if (!sseHadError) return;
+    sseHadError = false;
+    // SSE reconnected after a drop. If the proxy process restarted, its
+    // in-memory state (CSRF token, events, projects) is fresh and our local
+    // view is stale — reload to resync. Use the CSRF token as the restart
+    // marker: it's regenerated on every start.
+    fetch("/csrf").then(function(r) { return r.ok ? r.text() : null; }).then(function(t) {
+      if (t && t !== csrfToken) location.reload();
+    }).catch(function() {});
+  };
+  es.onerror = function() {
+    liveEl.classList.add("off");
+    sseHadError = true;
+  };
   es.onmessage = function(e) {
     liveEl.classList.remove("off");
     handleEvent(JSON.parse(e.data));

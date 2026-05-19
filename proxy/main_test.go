@@ -852,3 +852,68 @@ func TestDashboardGate_NoLocalAddr(t *testing.T) {
 		t.Error("expected reject when no local addr in context")
 	}
 }
+
+func TestDashboardHostAllowed(t *testing.T) {
+	cases := []struct {
+		host    string
+		allowed bool
+	}{
+		{"127.0.0.1:8081", true},
+		{"localhost:8081", true},
+		{"[::1]:8081", true},
+		{"LOCALHOST:8081", true},
+		{"127.0.0.1", true},
+		{"::1", true},
+		{"evil.example:8081", false},
+		{"evil.example", false},
+		{"192.168.1.5:8081", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Host = c.host
+		if got := dashboardHostAllowed(req); got != c.allowed {
+			t.Errorf("dashboardHostAllowed(Host=%q) = %v, want %v", c.host, got, c.allowed)
+		}
+	}
+}
+
+func TestDashboardOriginAllowed(t *testing.T) {
+	// GET ignores Origin regardless.
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("Origin", "http://evil.example")
+	if !dashboardOriginAllowed(req) {
+		t.Error("GET should ignore Origin")
+	}
+
+	// POST with allowed Origin.
+	for _, origin := range []string{"http://127.0.0.1:8081", "http://localhost:8081", "http://[::1]:8081"} {
+		req = httptest.NewRequest("POST", "/approve", nil)
+		req.Header.Set("Origin", origin)
+		if !dashboardOriginAllowed(req) {
+			t.Errorf("POST Origin=%q should be allowed", origin)
+		}
+	}
+
+	// POST with disallowed Origin.
+	for _, origin := range []string{"http://evil.example", "http://evil.example:8081", "https://127.0.0.1.evil.example"} {
+		req = httptest.NewRequest("POST", "/approve", nil)
+		req.Header.Set("Origin", origin)
+		if dashboardOriginAllowed(req) {
+			t.Errorf("POST Origin=%q should be rejected", origin)
+		}
+	}
+
+	// POST with absent Origin: allowed (non-browser caller, e.g. bach).
+	req = httptest.NewRequest("POST", "/project", nil)
+	if !dashboardOriginAllowed(req) {
+		t.Error("POST with no Origin should be allowed (non-browser path)")
+	}
+
+	// POST with garbage Origin: rejected.
+	req = httptest.NewRequest("POST", "/approve", nil)
+	req.Header.Set("Origin", "::::::not-a-url")
+	if dashboardOriginAllowed(req) {
+		t.Error("POST with malformed Origin should be rejected")
+	}
+}

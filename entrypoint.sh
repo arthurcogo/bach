@@ -9,9 +9,12 @@ if [ -d /certs ] && compgen -G "/certs/*.crt" > /dev/null 2>&1; then
     export NODE_EXTRA_CA_CERTS="$first_cert"
 fi
 
-# Seed agent's ~/.claude from staged credentials. The host extracts the OAuth
-# token from macOS keychain into /bach-runtime/.credentials.json (read-only
-# bind mount). We never bind-mount the host's ~/.claude itself.
+# Claude auth comes from CLAUDE_CODE_OAUTH_TOKEN in the env (a long-lived
+# setup-token minted on the host via `claude setup-token`, stashed in the
+# host keychain by `bach setup-claude-token`). We don't write a credentials
+# file at all — the env var is sufficient and sidesteps the OAuth refresh
+# race that happens when multiple short-lived-token clients refresh in
+# parallel.
 CLAUDE_DIR=/home/agent/.claude
 mkdir -p "$CLAUDE_DIR/projects" /home/agent/.local/share/mise
 # chown is best-effort: bind-mounted dirs may reject it but already appear as
@@ -19,12 +22,6 @@ mkdir -p "$CLAUDE_DIR/projects" /home/agent/.local/share/mise
 chown agent:agent "$CLAUDE_DIR" 2>/dev/null || true
 chown agent:agent "$CLAUDE_DIR/projects" 2>/dev/null || true
 chown agent:agent /home/agent/.local/share/mise 2>/dev/null || true
-
-if [ -f /bach-runtime/.credentials.json ]; then
-    cp /bach-runtime/.credentials.json "$CLAUDE_DIR/.credentials.json"
-    chown agent:agent "$CLAUDE_DIR/.credentials.json"
-    chmod 600 "$CLAUDE_DIR/.credentials.json"
-fi
 
 # Staged CLAUDE.md: host's ~/.claude/CLAUDE.md (if any) + bach sandbox suffix
 # appended by the wrapper. Tells the agent it's sandboxed and how to ask for
@@ -39,6 +36,7 @@ cat > "$CLAUDE_DIR/settings.json" <<'EOF'
 {
   "skipAutoPermissionPrompt": true,
   "awaySummaryEnabled": false,
+  "model": "opus",
   "permissions": {
     "defaultMode": "auto"
   }
