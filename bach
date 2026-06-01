@@ -107,6 +107,18 @@ def find_project() -> tuple[pathlib.Path, dict]:
             return d, merge_configs(user_cfg, project_cfg)
     return cwd, user_cfg
 
+
+def load_config_at(root: pathlib.Path) -> dict:
+    """Merged config for a known project root (no walking up). Used during
+    proxy-recovery re-registration where we already know the project root
+    from a session container's label."""
+    user_cfg = load_user_config()
+    cfg_path = root / ".bach.toml"
+    if cfg_path.exists():
+        with cfg_path.open("rb") as f:
+            return merge_configs(user_cfg, tomllib.load(f))
+    return user_cfg
+
 def project_id(root: pathlib.Path) -> str:
     return "bach-" + re.sub(r"[^a-z0-9-]+", "-", root.name.lower()).strip("-")
 
@@ -974,22 +986,27 @@ class DockerBackend(Backend):
         target_range = f"{PORT_ALLOC_START}-{PORT_ALLOC_END}"
         target_ports = f"{PROXY_PORT}:{PROXY_DASH_PORT}"
         state = self.container_state(PROXY_CONTAINER)
+        # Networks the proxy was attached to before recreation, so other
+        # projects' running sessions don't lose proxy access when the proxy
+        # image changes or its port config drifts.
+        preserved_nets: list[str] = []
         if state != "absent":
             data = self.inspect("container", PROXY_CONTAINER) or {}
             labels = (data.get("Config") or {}).get("Labels") or {}
             current_digest = labels.get("bach.proxy.image_digest", "")
             current_range = labels.get("bach.proxy.port_range", "")
             current_ports = labels.get("bach.proxy.ports", "")
+            reason = ""
             if current_digest != target_digest:
-                print(f"bach: recreating {PROXY_CONTAINER} (image changed)")
-                run([self.cli, "rm", "-f", PROXY_CONTAINER], check=False)
-                state = "absent"
+                reason = "image changed"
             elif current_range != target_range:
-                print(f"bach: recreating {PROXY_CONTAINER} (port range {current_range or '<unset>'} -> {target_range})")
-                run([self.cli, "rm", "-f", PROXY_CONTAINER], check=False)
-                state = "absent"
+                reason = f"port range {current_range or '<unset>'} -> {target_range}"
             elif current_ports != target_ports:
-                print(f"bach: recreating {PROXY_CONTAINER} (proxy/dash ports {current_ports or '<unset>'} -> {target_ports})")
+                reason = f"proxy/dash ports {current_ports or '<unset>'} -> {target_ports}"
+            if reason:
+                nets = ((data.get("NetworkSettings") or {}).get("Networks") or {})
+                preserved_nets = [n for n in nets if n != INTERNET_NET]
+                print(f"bach: recreating {PROXY_CONTAINER} ({reason})")
                 run([self.cli, "rm", "-f", PROXY_CONTAINER], check=False)
                 state = "absent"
         if state == "absent":
@@ -1013,9 +1030,73 @@ class DockerBackend(Backend):
             ])
         elif state == "stopped":
             run([self.cli, "start", PROXY_CONTAINER])
-        # Idempotently join the project network.
-        if not self._proxy_on_net(net):
-            run([self.cli, "network", "connect", net, PROXY_CONTAINER])
+        sessions = self._running_session_projects()
+        # Reattach to every project network the proxy needs to reach.
+        # Includes the current invocation's net plus anything the previous
+        # proxy container was on (preserved on recreate above) and any
+        # project network with a live session (covers sessions started while
+        # the proxy was down).
+        wanted: set[str] = {net, *preserved_nets}
+        for s in sessions:
+            if s["net"]:
+                wanted.add(s["net"])
+        for n in sorted(wanted):
+            if not self._proxy_on_net(n):
+                run([self.cli, "network", "connect", n, PROXY_CONTAINER])
+
+        # On recreate, the proxy's in-memory projectStore is wiped. Sessions
+        # of OTHER projects (not this invocation's) would sit default-denied
+        # until something runs `bach <cmd>` in them. Re-register every project
+        # we can identify from its session's label.
+        if preserved_nets:
+            stranded = [s for s in sessions if s["net"] and s["net"] != net]
+            for s in stranded:
+                root_str = s.get("root")
+                if not root_str:
+                    print(
+                        f"bach: warning: live session on {s['net']} predates "
+                        "the project_root label; re-register manually with "
+                        "`bach up` in that project",
+                        file=sys.stderr,
+                    )
+                    continue
+                try:
+                    root = pathlib.Path(root_str)
+                    cfg = load_config_at(root)
+                    register_project_with_proxy(root, cfg, self, s["net"])
+                except Exception as e:
+                    print(
+                        f"bach: warning: re-registering {s['net']} failed: {e}",
+                        file=sys.stderr,
+                    )
+
+    def _running_session_projects(self) -> list[dict]:
+        """For each running bach session, return {net, root} from its labels,
+        deduped by net. Used to keep the proxy reattached and re-registered
+        across recreates."""
+        res = subprocess.run(
+            [self.cli, "ps",
+             "--filter", "label=bach.role=session",
+             "--filter", "status=running",
+             "--format", "{{.Names}}"],
+            capture_output=True, text=True,
+        )
+        if res.returncode != 0:
+            return []
+        seen: set[str] = set()
+        out: list[dict] = []
+        for name in res.stdout.splitlines():
+            name = name.strip()
+            if not name:
+                continue
+            data = self.inspect("container", name) or {}
+            labels = (data.get("Config") or {}).get("Labels") or {}
+            net = labels.get("bach.project") or ""
+            if not net or net in seen:
+                continue
+            seen.add(net)
+            out.append({"net": net, "root": labels.get("bach.project_root")})
+        return out
 
     def _ensure_proxy_image(self) -> None:
         if self.image_inspect(PROXY_IMAGE):
