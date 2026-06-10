@@ -231,16 +231,6 @@ Recently shipped (don't reintroduce as deferred): clone-RO source mode is the de
 - **Bind mounts for mise cache + projects history**, named volumes only for per-project service data. Original reason: the (now-removed) Apple backend couldn't mount a named volume into two containers concurrently, and parallel sessions are the whole point of bach. Kept as-is — bind mounts also give host-side visibility of the cache/history and are battle-tested here.
 - **Threat model is "claude does dumb things, not actively malicious."** Default source mode is clone-from-host-RO (`.git` mounted read-only, worktree backed by alternates; changes only persist via `git push`), which already covers most of the "stop claude from blasting the host tree" case. `source_mode = "bind"` falls back to a RW bind for users who want host-side edits live. Sandbox isolates blast radius from host, not session-to-session. If threat shifts to active-malicious, the stricter knobs left are: force `source_mode = "clone"` everywhere, tighten the proxy allowlist per-project, and revisit `agent` having any FS writes outside `/work`.
 
-## Recent session (this one) achievements
-
-End-to-end working from zero:
-- Image built, claude works, mise works, sops via `[[stage]]` works, all configured services up.
-- Trust prompt suppressed for `/work`. Onboarding seeded.
-- Network properly locked down — verified bypass attempts fail.
-- Bash job control around claude.
-- Two concurrent sessions on different projects: works.
-- Two concurrent sessions on the same project: works; second one skips port-publishing if host port is taken.
-
 ## Coding conventions in `bach` (the Python script)
 
 - stdlib only, no third-party deps (so it runs from a symlink with no venv).
