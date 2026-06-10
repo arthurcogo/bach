@@ -450,19 +450,35 @@ type EventStore struct {
 	mu          sync.Mutex
 	events      []ProxyEvent
 	capacity    int
+	ttl         time.Duration
 	subscribers map[chan ProxyEvent]struct{}
 }
 
-func NewEventStore(capacity int) *EventStore {
+func NewEventStore(capacity int, ttl time.Duration) *EventStore {
 	return &EventStore{
 		events:      make([]ProxyEvent, 0, capacity),
 		capacity:    capacity,
+		ttl:         ttl,
 		subscribers: make(map[chan ProxyEvent]struct{}),
+	}
+}
+
+// pruneLocked drops events older than ttl. Events are appended in
+// chronological order, so expired entries form a prefix.
+func (s *EventStore) pruneLocked(now time.Time) {
+	cutoff := now.Add(-s.ttl)
+	i := 0
+	for i < len(s.events) && s.events[i].Timestamp.Before(cutoff) {
+		i++
+	}
+	if i > 0 {
+		s.events = append(s.events[:0], s.events[i:]...)
 	}
 }
 
 func (s *EventStore) Add(e ProxyEvent) {
 	s.mu.Lock()
+	s.pruneLocked(time.Now())
 	if len(s.events) >= s.capacity {
 		s.events = s.events[1:]
 	}
@@ -479,6 +495,7 @@ func (s *EventStore) Add(e ProxyEvent) {
 func (s *EventStore) Recent() []ProxyEvent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneLocked(time.Now())
 	out := make([]ProxyEvent, len(s.events))
 	copy(out, s.events)
 	return out
@@ -517,7 +534,7 @@ func (s *EventStore) Update(id string, status string) {
 	}
 }
 
-var eventStore = NewEventStore(1000)
+var eventStore = NewEventStore(1000, 30*time.Minute)
 
 // matchesPatterns returns true if host matches any pattern in the list.
 // Patterns are either exact (`api.github.com`) or wildcard suffix

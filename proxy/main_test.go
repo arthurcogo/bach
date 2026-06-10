@@ -917,3 +917,34 @@ func TestDashboardOriginAllowed(t *testing.T) {
 		t.Error("POST with malformed Origin should be rejected")
 	}
 }
+
+func TestEventStoreTTL(t *testing.T) {
+	s := NewEventStore(10, 30*time.Minute)
+	now := time.Now()
+	s.Add(ProxyEvent{ID: "old", Timestamp: now.Add(-time.Hour), Host: "old.example"})
+	s.Add(ProxyEvent{ID: "edge", Timestamp: now.Add(-29 * time.Minute), Host: "edge.example"})
+	s.Add(ProxyEvent{ID: "new", Timestamp: now, Host: "new.example"})
+
+	got := s.Recent()
+	if len(got) != 2 {
+		t.Fatalf("Recent() returned %d events, want 2: %+v", len(got), got)
+	}
+	if got[0].ID != "edge" || got[1].ID != "new" {
+		t.Errorf("Recent() = %q, %q; want edge, new", got[0].ID, got[1].ID)
+	}
+}
+
+func TestEventStoreCapacity(t *testing.T) {
+	s := NewEventStore(3, time.Hour)
+	now := time.Now()
+	for i := 0; i < 5; i++ {
+		s.Add(ProxyEvent{ID: fmt.Sprintf("e%d", i), Timestamp: now})
+	}
+	got := s.Recent()
+	if len(got) != 3 {
+		t.Fatalf("Recent() returned %d events, want 3", len(got))
+	}
+	if got[0].ID != "e2" || got[2].ID != "e4" {
+		t.Errorf("Recent() = %q..%q; want e2..e4", got[0].ID, got[2].ID)
+	}
+}
