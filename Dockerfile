@@ -47,15 +47,21 @@ RUN useradd --create-home --shell /bin/bash --uid 1000 agent \
     && mkdir -p /work /certs \
     && chown agent:agent /work
 
-# Install claude + mise as the agent user so they land in /home/agent.
+# Install mise as the agent user so it lands in /home/agent. Claude is NOT
+# baked into the image: bach caches the current linux binary on the
+# host (~/.local/share/bach/cache/claude), mounts it read-only at
+# /bach-claude, and the entrypoint symlinks it to ~/.local/bin/claude — so
+# claude updates never require an image rebuild.
 USER agent
 WORKDIR /home/agent
-RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN curl -fsSL https://mise.run | sh
 
 # Set PATH for agent. Affects the dropped-priv shell launched by entrypoint.
 ENV PATH="/home/agent/.local/bin:/home/agent/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV MISE_TRUSTED_CONFIG_PATHS="/work"
+# The claude binary lives on a read-only mount, so the in-place auto-updater
+# could only fail. Updates come via bach's host-side binary cache instead.
+ENV DISABLE_AUTOUPDATER="1"
 
 RUN cat >> /home/agent/.bashrc <<'EOF'
 

@@ -32,17 +32,36 @@ if [ -f /bach-runtime/CLAUDE.md ]; then
     chmod 644 "$CLAUDE_DIR/CLAUDE.md"
 fi
 
-cat > "$CLAUDE_DIR/settings.json" <<'EOF'
+# BACH_CLAUDE_MODEL (.bach.toml `claude_model`) pins the default model; when
+# unset, no `model` key is written and claude uses its own default. The value
+# is validated by the wrapper (no quotes/backslashes), so direct interpolation
+# into the JSON is safe.
+model_line=""
+if [ -n "${BACH_CLAUDE_MODEL:-}" ]; then
+    model_line="\"model\": \"$BACH_CLAUDE_MODEL\","
+fi
+cat > "$CLAUDE_DIR/settings.json" <<EOF
 {
   "skipAutoPermissionPrompt": true,
   "awaySummaryEnabled": false,
-  "model": "opus",
+  $model_line
   "permissions": {
     "defaultMode": "auto"
   }
 }
 EOF
 chown agent:agent "$CLAUDE_DIR/settings.json"
+
+# Claude binary: bach keeps a host-side cache of linux claude builds, mounted
+# read-only at /bach-claude, and picks the version via BACH_CLAUDE_BIN — so a
+# new claude release never needs an image rebuild. Symlink it onto the
+# agent's PATH. ~/.local/bin already exists in the image (mise installs
+# there) but be defensive about it.
+if [ -n "${BACH_CLAUDE_BIN:-}" ] && [ -x "$BACH_CLAUDE_BIN" ]; then
+    mkdir -p /home/agent/.local/bin
+    ln -sfn "$BACH_CLAUDE_BIN" /home/agent/.local/bin/claude
+    chown -h agent:agent /home/agent/.local/bin/claude 2>/dev/null || true
+fi
 
 # Mirror host git identity so commits made inside the session have the same
 # author as ones the user makes on the host. Wrapper reads `git config

@@ -10,6 +10,9 @@
 [[ports]]
 name = "web"
 container = 4000
+# scheme = "https"        # optional, default http (controls the dashboard link)
+# hostname = "app.local"  # optional, default localhost; vanity host shown in the
+                          # dashboard link — point it at 127.0.0.1 in /etc/hosts
 
 # Persistent named volume for mise's tool cache, shared across all bach
 # projects so identical tool versions only download once. Set to false to

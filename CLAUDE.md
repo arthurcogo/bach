@@ -19,7 +19,8 @@ Sandboxed Claude Code in a Linux container. Docker backend (behind a `Backend` a
 
 ```
 bach              # Python 3 CLI (single file, stdlib only). Symlinked to ~/.local/bin/bach.
-Dockerfile        # bach:base. Debian trixie-slim + claude + mise + gh credential helper + entrypoint.
+Dockerfile        # bach:base. Debian trixie-slim + mise + gh credential helper + entrypoint.
+                  # Claude is NOT in the image — see the host-side binary cache below.
 entrypoint.sh     # Runs as root: seeds ~/.claude (+ gh config + onboarding), applies
                   # BACH_ALIASES, [[stage]] manifest, clone-mode worktree init,
                   # [[cache]] overlay warm/promote, exports HOME/USER/LOGNAME/SHELL,
@@ -38,6 +39,7 @@ README.md         # User-facing docs.
 ## Host paths (XDG)
 
 - `~/.local/share/bach/cache/mise/` — mise tool cache (bind mount into all sessions)
+- `~/.local/share/bach/cache/claude/<ver>-<platform>/claude` — claude binary cache. Claude is not baked into the image: on every session start bach resolves the current version (`latest` channel — what the standard installer/autoupdater track; `stable` lags) from `downloads.claude.ai` (host network, 5s timeout, falls back to newest cached on failure), downloads + sha256-verifies the linux binary once, mounts the cache RO at `/bach-claude`, and passes `BACH_CLAUDE_BIN`; the entrypoint symlinks it to `~/.local/bin/claude`. Claude updates need no rebuild of `bach:base` or per-project images. Keeps newest 3 versions per platform (in-flight sessions may still execute an older one off the RO mount).
 - `~/.local/share/bach/cache/projects/<proj>/<slug>/` — per-project `[[cache]]` host base
 - `~/.local/share/bach/projects/<proj>/` — claude conversation history per project (bind mount)
 - bach-proxy log — `docker logs bach-proxy`
@@ -53,27 +55,31 @@ Walked up from `cwd`. Project root = the dir containing `.bach.toml` (or `cwd` i
 A user-level file at `$XDG_CONFIG_HOME/bach/config.toml` (default `~/.config/bach/config.toml`) is loaded first and the project's `.bach.toml` is layered on top. Same schema. Merge in `merge_configs()`:
 - Lists concat: `apt_packages`, `ports`, `allowlist`, `denylist`, `stage`, `mounts`, `cache`, `volumes`, `install`.
 - Tables merge by key, later wins per key: `env`, `aliases`. `services` is replace-by-name (collision = project's spec wins entirely, no deep merge).
-- Scalars last-wins (`image`, `mise_cache`).
+- Scalars last-wins (`image`, `mise_cache`, `claude_model`).
 
 `[[mounts]].source` is `expanduser`'d, so user-level mounts can use `~/...` (e.g. `~/.config/nvim`). Relative sources still resolve against the project root. Optional `chown = true` per mount adds the target to `BACH_CHOWN` env (newline-separated); the entrypoint chowns each non-recursively to agent. Needed for writable bind mounts under `/home/agent` because VirtioFS preserves the host uid on bind mounts (a host dir owned by 501:20 appears as 501:20 inside the container, so agent/1000 can't write). Non-recursive is enough: future files agent creates inherit agent ownership. Ignored when `readonly = true`. Do not enable for host trees outside the bach cache area — chown propagates back to the host via VirtioFS.
 
 ```toml
 image = "bach:base"                                # override the session image
 mise_cache = true
+claude_model = "opus"                              # pin claude's default model; unset (default) = claude's own default
 
 # Forwarded ports. bach auto-assigns a host port (starting at 4100) per
 # named entry; the proxy dashboard shows the assigned URL. Allocations are
 # sticky per (project, name) across restarts when free, otherwise the next
 # free port wins. Optional `host` pins a specific host port; optional
-# `scheme` (http|https, default http) controls the dashboard link.
+# `scheme` (http|https, default http) controls the dashboard link;
+# optional `hostname` (default localhost) sets the host shown in the
+# dashboard link — use a vanity name that resolves to localhost.
 # State lives at ~/.local/state/bach/ports.json. Cleanup: bach releases
 # its own session's ports on exit; every bach invocation also reaps
 # entries whose session container is no longer running.
 [[ports]]
 name = "web"
 container = 4000
-# host = 4100        # optional pin
-# scheme = "https"   # optional, default "http"
+# host = 4100            # optional pin
+# scheme = "https"       # optional, default "http"
+# hostname = "app.local" # optional, default "localhost" (dashboard link host)
 apt_packages = ["build-essential", "libatomic1"]   # builds bach-proj:<hash> on top of bach:base
 
 # Arbitrary install scripts during per-project image build. Each script gets
@@ -200,7 +206,7 @@ When `.bach.toml` has `apt_packages`, the wrapper generates a tiny Dockerfile (`
 - `bach up` / `bach down` — start/stop the proxy + backend services for the project.
 - `bach status` — project, backend, proxy, and service state.
 - `bach log` — `docker logs --tail 50 bach-proxy`.
-- `bach build` — rebuild `bach:base` from this repo's Dockerfile. Per-project images auto-invalidate on next session (their hash includes the base image digest).
+- `bach build [--cache]` — rebuild `bach:base` from this repo's Dockerfile, from scratch by default (`--no-cache`). Pass `--cache` to reuse the layer cache. Per-project images auto-invalidate on next session (their hash includes the base image digest). Claude updates don't need this — the binary comes from the host-side cache, not the image.
 
 Source mode is set via `.bach.toml` `source_mode = "auto" | "clone" | "bind"` (default `auto`). No CLI flag — was previously `--no-clone`, removed in favour of the TOML knob.
 

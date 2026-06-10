@@ -91,10 +91,12 @@ func NewTemporaryAllowStore() *TemporaryAllowStore {
 	return &TemporaryAllowStore{hosts: make(map[string]time.Time)}
 }
 
-func (s *TemporaryAllowStore) Allow(host string) {
+func (s *TemporaryAllowStore) Allow(host string) time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.hosts[host] = time.Now().Add(tempAllowDuration)
+	exp := time.Now().Add(tempAllowDuration)
+	s.hosts[host] = exp
+	return exp
 }
 
 func (s *TemporaryAllowStore) Revoke(host string) {
@@ -152,6 +154,7 @@ type ProjectPort struct {
 	HostPort      int    `json:"host_port"`
 	ContainerPort int    `json:"container_port"`
 	Scheme        string `json:"scheme"`
+	Hostname      string `json:"hostname"`
 }
 
 // ProjectStore maps source CIDRs to Project metadata. bach registers each
@@ -807,9 +810,10 @@ func handleApprove(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
-	tempAllowStore.Allow(tempAllowKey(project, host))
+	exp := tempAllowStore.Allow(tempAllowKey(project, host))
 	pendingStore.ApproveHost(project, host)
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]int64{"expires_at": exp.UnixMilli()})
 }
 
 func handleRevoke(w http.ResponseWriter, r *http.Request) {
@@ -915,6 +919,7 @@ func handlePorts(w http.ResponseWriter, r *http.Request) {
 		HostPort      int    `json:"host_port"`
 		ContainerPort int    `json:"container_port"`
 		Scheme        string `json:"scheme"`
+		Hostname      string `json:"hostname"`
 	}
 	out := []row{}
 	for _, p := range projectStore.List() {
@@ -923,7 +928,7 @@ func handlePorts(w http.ResponseWriter, r *http.Request) {
 			if scheme == "" {
 				scheme = "http"
 			}
-			out = append(out, row{p.Name, port.Session, port.Name, port.HostPort, port.ContainerPort, scheme})
+			out = append(out, row{p.Name, port.Session, port.Name, port.HostPort, port.ContainerPort, scheme, port.Hostname})
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1622,9 +1627,15 @@ const dashboardHTML = `<!DOCTYPE html>
 
   function effectiveStatus(h) {
     if (h.pendingCount > 0) return "pending";
-    // Server temp-allows expire after a fixed window. If we've successfully
-    // loaded the temp-allow snapshot and this host isn't in it, the row is
-    // stale — demote so the action button flips back to "allow".
+    // The temp-allow snapshot is authoritative for whether a host is
+    // currently allowed: it survives page reloads, whereas the optimistic
+    // latestStatus set on approve does not. Promote any host with a live
+    // temp-allow so a row whose last *event* was "rejected" (denylisted host,
+    // or a pending that timed out before approval) still shows temp_allowed
+    // after a refresh.
+    if (tempExpiryLoaded && tempExpiry[h.key]) return "temp_allowed";
+    // Conversely, once the temp-allow expires and we've loaded the snapshot,
+    // demote a stale temp_allowed row so the action button flips back to "allow".
     if (h.latestStatus === "temp_allowed" && tempExpiryLoaded && !tempExpiry[h.key]) return "rejected";
     return h.latestStatus === "pending" ? "rejected" : h.latestStatus;
   }
@@ -1788,13 +1799,18 @@ const dashboardHTML = `<!DOCTYPE html>
   window.approveHost = function(project, host) {
     var key = rowKey(project, host);
     postWithCsrfRetry("/approve?project=" + encodeURIComponent(project) + "&host=" + encodeURIComponent(host)).then(function(resp) {
-      if (resp.ok && hosts[key]) {
-        hosts[key].latestStatus = "temp_allowed";
-        renderRow(hosts[key]);
-        updateBadges();
-      } else if (!resp.ok) {
-        console.warn("approve failed:", resp.status);
-      }
+      if (!resp.ok) { console.warn("approve failed:", resp.status); return; }
+      // Write the authoritative expiry into tempExpiry synchronously so
+      // effectiveStatus promotes the row to temp_allowed on this render —
+      // without it the row stays rejected until the next /temp-allows poll.
+      return resp.json().then(function(body) {
+        if (body && body.expires_at) tempExpiry[key] = body.expires_at;
+        if (hosts[key]) {
+          hosts[key].latestStatus = "temp_allowed";
+          renderRow(hosts[key]);
+          updateBadges();
+        }
+      }).catch(function() {});
     });
   };
 
@@ -1802,6 +1818,9 @@ const dashboardHTML = `<!DOCTYPE html>
     var key = rowKey(project, host);
     postWithCsrfRetry("/revoke?project=" + encodeURIComponent(project) + "&host=" + encodeURIComponent(host)).then(function(resp) {
       if (resp.ok && hosts[key]) {
+        // Clear the local temp-allow immediately; otherwise effectiveStatus
+        // keeps promoting the row to temp_allowed until the next poll.
+        delete tempExpiry[key];
         hosts[key].latestStatus = "rejected";
         renderRow(hosts[key]);
         updateBadges();
@@ -1850,7 +1869,7 @@ const dashboardHTML = `<!DOCTYPE html>
         return a.host_port - b.host_port;
       });
       rows.forEach(function(row) {
-        var url = (row.scheme || "http") + "://localhost:" + row.host_port + "/";
+        var url = (row.scheme || "http") + "://" + row.hostname + ":" + row.host_port + "/";
         var tr = document.createElement("tr");
         tr.innerHTML = "<td class='project'>" + esc(row.project) + "</td>" +
           "<td class='session'>" + esc(row.session || "") + "</td>" +

@@ -38,6 +38,12 @@ PROXY_IMAGE = "bach-proxy:latest"
 INTERNET_NET = "bach-internet"
 BACH_TOKEN_KEYCHAIN_SERVICE = "bach: Claude Code OAuth Token"
 MISE_CACHE_HOST = BACH_DATA / "cache" / "mise"
+CLAUDE_CACHE_HOST = BACH_DATA / "cache" / "claude"
+# Same release endpoints claude.ai/install.sh uses: `<base>/latest` returns a
+# version string (the `latest` channel is what the standard installer and the
+# autoupdater track; `stable` lags it), `<base>/<ver>/manifest.json` carries
+# per-platform sha256s, `<base>/<ver>/<platform>/claude` is the binary.
+CLAUDE_DOWNLOAD_BASE = "https://downloads.claude.ai/claude-code-releases"
 PROJECTS_HOST = BACH_DATA / "projects"
 PORTS_STATE_FILE = BACH_STATE / "ports.json"
 # Range pre-published on the bach-proxy container at startup. Session
@@ -293,7 +299,8 @@ def host_port_free(port: int) -> bool:
 def parse_ports(cfg: dict) -> list[dict]:
     """Validate and normalize the [[ports]] entries from .bach.toml.
     Each entry: name (str), container (int), optional host (int) pin,
-    optional scheme ("http"|"https", default "http")."""
+    optional scheme ("http"|"https", default "http"), optional hostname
+    (str, default "localhost") used for the dashboard link."""
     raw = cfg.get("ports") or []
     if not isinstance(raw, list):
         print("bach: warning: .bach.toml `ports` must be a list of tables; ignoring", file=sys.stderr)
@@ -324,7 +331,11 @@ def parse_ports(cfg: dict) -> list[dict]:
         if scheme not in ("http", "https"):
             print(f"bach: warning: ports[{name}].scheme must be http|https; defaulting to http", file=sys.stderr)
             scheme = "http"
-        out.append({"name": name, "container": container, "host": host, "scheme": scheme})
+        hostname = entry.get("hostname", "localhost")
+        if not isinstance(hostname, str) or not hostname:
+            print(f"bach: warning: ports[{name}].hostname must be a non-empty string; defaulting to localhost", file=sys.stderr)
+            hostname = "localhost"
+        out.append({"name": name, "container": container, "host": host, "scheme": scheme, "hostname": hostname})
     return out
 
 
@@ -452,6 +463,7 @@ def allocate_ports(
                 "container_port": p["container"],
                 "host_port": chosen,
                 "scheme": p.get("scheme", "http"),
+                "hostname": p["hostname"],
             }
             allocs.append(alloc)
             out.append(alloc)
@@ -488,6 +500,7 @@ def project_port_map(allocations: list[dict], project: str) -> list[dict]:
             "host_port": a["host_port"],
             "container_port": a["container_port"],
             "scheme": a.get("scheme", "http"),
+            "hostname": a.get("hostname", "localhost"),  # tolerate pre-upgrade ports.json
         }
         for a in allocations if a.get("project") == project
     ]
@@ -616,8 +629,12 @@ class Backend:
         caches when the base image is rebuilt. Empty string if missing."""
         raise NotImplementedError
 
-    def image_build(self, tag: str, build_dir: pathlib.Path) -> None:
-        run([self.cli, "build", "-t", tag, str(build_dir)])
+    def image_build(self, tag: str, build_dir: pathlib.Path, no_cache: bool = False) -> None:
+        cmd = [self.cli, "build"]
+        if no_cache:
+            cmd.append("--no-cache")
+        cmd += ["-t", tag, str(build_dir)]
+        run(cmd)
 
     def ensure_registry_auth(self, image: str) -> None:
         """Log into the image's registry on the host if needed. Per-process
@@ -993,6 +1010,123 @@ def ensure_project_image(cfg: dict, backend: Backend) -> str:
     backend.image_build(tag, build_dir)
     return tag
 
+# ---------- claude binary cache ----------
+
+# Claude lives in a host-side cache, not in the image, so picking up a new
+# claude release never rebuilds bach:base or any per-project image. bach
+# resolves the current version on the host (full network, no proxy
+# involved), downloads the linux binary into the cache once, and bind-mounts
+# the cache read-only at /bach-claude; the entrypoint symlinks the chosen
+# version onto the agent's PATH. RO mount also means concurrent sessions
+# can't race, and in-flight sessions keep the version they started with.
+
+def _claude_platform(backend: Backend) -> str:
+    """Claude release platform string for the container architecture — the
+    docker server's, not the host's (bach runs on macOS, sessions are linux).
+    bach:base is Debian (glibc), so never the -musl variant."""
+    res = subprocess.run(
+        [backend.cli, "version", "--format", "{{.Server.Arch}}"],
+        capture_output=True, text=True,
+    )
+    arch = res.stdout.strip()
+    return {"amd64": "linux-x64", "arm64": "linux-arm64"}.get(arch, "linux-arm64")
+
+def _claude_version_key(name: str) -> tuple[int, int, int]:
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", name)
+    return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+def _newest_cached_claude(platform: str) -> str | None:
+    dirs = [
+        d.name for d in CLAUDE_CACHE_HOST.iterdir()
+        if d.name.endswith(f"-{platform}") and (d / "claude").is_file()
+    ]
+    return max(dirs, key=_claude_version_key) if dirs else None
+
+def _download_claude(version: str, platform: str, target: pathlib.Path) -> None:
+    """Download + sha256-verify one claude release into the cache. Atomic:
+    stream to a tmp file, verify against the manifest checksum, rename."""
+    with urllib.request.urlopen(f"{CLAUDE_DOWNLOAD_BASE}/{version}/manifest.json", timeout=10) as r:
+        manifest = json.load(r)
+    checksum = ((manifest.get("platforms") or {}).get(platform) or {}).get("checksum", "")
+    if not re.fullmatch(r"[a-f0-9]{64}", checksum):
+        raise RuntimeError(f"no checksum for {platform} in manifest")
+    print(f"bach: downloading claude {version} ({platform})")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CLAUDE_CACHE_HOST / f".download-{version}-{platform}.{os.getpid()}.tmp"
+    h = hashlib.sha256()
+    try:
+        with urllib.request.urlopen(f"{CLAUDE_DOWNLOAD_BASE}/{version}/{platform}/claude", timeout=60) as r, \
+                tmp.open("wb") as f:
+            while chunk := r.read(1 << 20):
+                h.update(chunk)
+                f.write(chunk)
+        if h.hexdigest() != checksum:
+            raise RuntimeError("checksum mismatch")
+        tmp.chmod(0o755)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+def _prune_claude_cache(platform: str, keep: int = 3) -> None:
+    """Drop all but the newest `keep` cached versions for this platform. Old
+    versions linger on purpose: a running session's RO mount may still be
+    executing one."""
+    dirs = sorted(
+        (d for d in CLAUDE_CACHE_HOST.iterdir()
+         if d.is_dir() and d.name.endswith(f"-{platform}")),
+        key=lambda d: _claude_version_key(d.name),
+    )
+    for d in dirs[:-keep]:
+        shutil.rmtree(d, ignore_errors=True)
+
+def ensure_claude_binary(backend: Backend) -> str | None:
+    """Ensure the current claude binary (latest channel) is cached at
+    ~/.local/share/bach/cache/claude/<ver>-<platform>/claude and return its
+    container path under the /bach-claude mount. Any network failure falls
+    back to the newest cached version so sessions still start offline;
+    returns None (with a warning) only when there's nothing cached at all."""
+    platform = _claude_platform(backend)
+    CLAUDE_CACHE_HOST.mkdir(parents=True, exist_ok=True)
+
+    version = None
+    try:
+        with urllib.request.urlopen(f"{CLAUDE_DOWNLOAD_BASE}/latest", timeout=5) as r:
+            v = r.read(64).decode("ascii", "replace").strip()
+        if re.match(r"^\d+\.\d+\.\d+", v):
+            version = v
+    except (urllib.error.URLError, OSError, TimeoutError):
+        pass
+
+    if version is None:
+        cached = _newest_cached_claude(platform)
+        if cached:
+            print(f"bach: claude {cached.removesuffix(f'-{platform}')} (cached; version check failed)")
+            return f"/bach-claude/{cached}/claude"
+        print(
+            "bach: warning: could not resolve the claude version and nothing is "
+            "cached; claude will be unavailable in this session",
+            file=sys.stderr,
+        )
+        return None
+
+    slug = f"{version}-{platform}"
+    target = CLAUDE_CACHE_HOST / slug / "claude"
+    if target.is_file():
+        print(f"bach: claude {version} (cached)")
+    else:
+        try:
+            _download_claude(version, platform, target)
+        except Exception as e:
+            print(f"bach: warning: claude {version} download failed: {e}", file=sys.stderr)
+            cached = _newest_cached_claude(platform)
+            if not cached:
+                return None
+            print(f"bach: claude {cached.removesuffix(f'-{platform}')} (cached; download of {version} failed)")
+            return f"/bach-claude/{cached}/claude"
+        print(f"bach: claude {version} (downloaded)")
+        _prune_claude_cache(platform)
+    return f"/bach-claude/{slug}/claude"
+
 # ---------- credentials ----------
 
 # Claude auth is centralised on the host as a long-lived OAuth token minted via
@@ -1305,7 +1439,7 @@ def session(root: pathlib.Path, cfg: dict, command: list[str], backend: Backend,
         live_sessions.add(session_name)
         allocations = allocate_ports(root.name, session_name, requested_ports, live_sessions)
         for a in allocations:
-            print(f"bach: port '{a['name']}' -> {a['scheme']}://localhost:{a['host_port']}/ -> :{a['container_port']}")
+            print(f"bach: port '{a['name']}' -> {a['scheme']}://{a['hostname']}:{a['host_port']}/ -> :{a['container_port']}")
 
     register_project_with_proxy(
         root, cfg, backend, net,
@@ -1379,6 +1513,24 @@ def session(root: pathlib.Path, cfg: dict, command: list[str], backend: Backend,
 
     claude_token = read_claude_oauth_token()
     cmd += ["-e", f"CLAUDE_CODE_OAUTH_TOKEN={claude_token}"]
+
+    # Optional default model for claude, seeded into the session's
+    # settings.json by the entrypoint. Unset = claude's own default.
+    model = cfg.get("claude_model")
+    if model is not None:
+        if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9._:\[\]-]+", model):
+            cmd += ["-e", f"BACH_CLAUDE_MODEL={model}"]
+        else:
+            print(f"bach: warning: ignoring invalid claude_model {model!r}", file=sys.stderr)
+
+    # Claude binary comes from the host-side cache (see ensure_claude_binary),
+    # mounted RO; the entrypoint symlinks it to ~/.local/bin/claude.
+    claude_bin = ensure_claude_binary(backend)
+    if claude_bin:
+        cmd += [
+            "--mount", f"type=bind,source={CLAUDE_CACHE_HOST},target=/bach-claude,readonly",
+            "-e", f"BACH_CLAUDE_BIN={claude_bin}",
+        ]
 
     rt = runtime_dir()
     stage_claude_md(rt)
@@ -1551,9 +1703,10 @@ def cmd_log(backend: Backend) -> None:
         return
     subprocess.run(log_cmd)
 
-def cmd_build(backend: Backend) -> None:
-    print(f"bach: building {DEFAULT_IMAGE} from {BACH_REPO}")
-    backend.image_build(DEFAULT_IMAGE, BACH_REPO)
+def cmd_build(backend: Backend, use_cache: bool = False) -> None:
+    cache_note = "" if use_cache else " (no cache)"
+    print(f"bach: building {DEFAULT_IMAGE} from {BACH_REPO}{cache_note}")
+    backend.image_build(DEFAULT_IMAGE, BACH_REPO, no_cache=not use_cache)
 
 def cmd_ps(backend: Backend) -> None:
     root, _ = find_project()
@@ -1583,18 +1736,37 @@ def pick_session(backend: Backend, root: pathlib.Path, target: str | None) -> st
             for n in names:
                 print(f"  {n}", file=sys.stderr)
             sys.exit(1)
+        if shutil.which("fzf"):
+            proc = subprocess.run(
+                ["fzf", "--height=~40%", "--reverse", "--prompt=session> "],
+                input="\n".join(names) + "\n",
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            choice = proc.stdout.strip()
+            if proc.returncode != 0 or choice not in names:
+                sys.exit(1)
+            return choice
         print("multiple running sessions:", file=sys.stderr)
         for i, n in enumerate(names, 1):
             print(f"  {i}) {n}", file=sys.stderr)
         while True:
             try:
-                raw = input(f"pick [1-{len(names)}]: ").strip()
+                raw = input(f"pick [1-{len(names)} or substring]: ").strip()
             except (EOFError, KeyboardInterrupt):
                 print(file=sys.stderr)
                 sys.exit(1)
             if raw.isdigit() and 1 <= int(raw) <= len(names):
                 return names[int(raw) - 1]
-            print("invalid", file=sys.stderr)
+            matches = [n for n in names if raw and raw in n]
+            if len(matches) == 1:
+                return matches[0]
+            if matches:
+                print("ambiguous:", file=sys.stderr)
+                for n in matches:
+                    print(f"  {n}", file=sys.stderr)
+            else:
+                print("invalid", file=sys.stderr)
     return names[0]
 
 def cmd_exec(backend: Backend, args: list[str]) -> None:
@@ -1660,9 +1832,13 @@ SUBCOMMANDS
   down                    Stop the project's backend services.
   status                  Show project, backend, proxy, and service state.
   log                     Tail the bach-proxy log.
-  build                   Rebuild the bach:base image from this repo's
-                          Dockerfile. Per-project images auto-invalidate on
-                          next session.
+  build [--cache]         Rebuild the bach:base image from this repo's
+                          Dockerfile, from scratch by default. Pass --cache
+                          to reuse the layer cache. Per-project images
+                          auto-invalidate on next session. (Claude is not in
+                          the image — bach caches the current binary
+                          on the host and mounts it in, so claude updates
+                          need no rebuild.)
   setup-claude-token      One-time setup: mint a long-lived Claude Code OAuth
                           token via `claude setup-token` on the host and store
                           it in the macOS keychain. Required before the first
@@ -1686,10 +1862,13 @@ CONFIG (.bach.toml)
     mise_cache = true                # share host mise tool cache
     apt_packages = ["build-essential"]  # extra apt packages → per-project image
     image = "bach:base"              # override the base image
+    claude_model = "opus"            # pin claude's default model
+                                     # (unset = claude's own default)
 
     [[ports]]                        # forwarded ports; host port auto-assigned
     name = "web"                     # from 4100 upwards. Sticky per (project,name).
-    container = 4000                 # Optional: host = N (pin), scheme = "https".
+    container = 4000                 # Optional: host = N (pin), scheme = "https",
+                                     # hostname = "app.local" (dashboard link host).
 
     [aliases]                        # bash aliases inside the container
     c  = "claude"
@@ -1725,6 +1904,8 @@ EXAMPLES
 PATHS
   ~/.local/share/bach/projects/<proj>/   Per-project Claude history.
   ~/.local/share/bach/cache/mise/        Shared mise tool cache.
+  ~/.local/share/bach/cache/claude/      Cached claude binaries (mounted RO
+                                         into every session; auto-updated).
   bach log                               Tails `docker logs bach-proxy`.
 """
 
@@ -1786,7 +1967,7 @@ def main() -> None:
     elif args and args[0] == "ps":
         cmd_ps(backend)
     elif args and args[0] == "build":
-        cmd_build(backend)
+        cmd_build(backend, use_cache="--cache" in args[1:])
     elif args and args[0] in ("exec", "e"):
         cmd_exec(backend, args[1:])
     elif args and args[0] in ("shell", "s"):

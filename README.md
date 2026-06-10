@@ -91,18 +91,22 @@ Walked up from the cwd. The directory containing it is the project root.
 source_mode = "auto"                # auto (default) | clone | bind. See *Source mode*.
 image = "bach:base"                 # override the base image
 mise_cache = true                   # share host mise tool cache (default true)
+claude_model = "opus"               # pin claude's default model (unset = claude's own default)
 
 # Forwarded ports. bach auto-assigns a host port (first free from 4100
 # upwards) per named entry and the proxy dashboard renders a clickable
 # `http://localhost:<port>/` link. Allocations are sticky per (project,
 # name) across restarts when free; a second concurrent session of the
 # same project just gets the next free port. `host` pins a specific
-# port; `scheme` (http|https, default http) controls the dashboard link.
+# port; `scheme` (http|https, default http) controls the dashboard link;
+# `hostname` (default localhost) sets the host in the dashboard link —
+# use a vanity name that resolves to localhost (e.g. via /etc/hosts).
 [[ports]]
 name = "web"
 container = 4000
-# host = 4100          # optional pin
-# scheme = "https"     # optional, default http
+# host = 4100              # optional pin
+# scheme = "https"         # optional, default http
+# hostname = "app.local"   # optional, default localhost (dashboard link host)
 apt_packages = ["build-essential"]  # → builds bach-proj:<hash> on top of bach:base
 
 # Arbitrary install steps run during the per-project image build (alongside
@@ -201,7 +205,7 @@ Merge rules:
 - Tables merge by key, later wins per key: `env`, `aliases`. `[services.<name>]`
   is replace-by-name (project-level service spec fully replaces user-level one
   with the same name; no deep merge of `env`/`volumes`/...).
-- Scalars last-wins: `image`, `mise_cache`.
+- Scalars last-wins: `image`, `mise_cache`, `claude_model`.
 
 Example — neovim in every session:
 
@@ -255,6 +259,13 @@ etc.) avoid running updates from two sessions concurrently.
   across all projects. Per-project conversation history at
   `~/.local/share/bach/projects/<proj>/`. Per-project build caches (`[[cache]]`)
   under `~/.local/share/bach/cache/projects/<proj>/`.
+- **Claude binary**: not baked into the image. On session start bach resolves
+  the current version (on the host — no proxy involved), downloads the
+  linux binary once into `~/.local/share/bach/cache/claude/`, and mounts the
+  cache read-only at `/bach-claude`; the entrypoint symlinks it to
+  `~/.local/bin/claude`. Claude updates therefore need no image rebuild — not
+  of `bach:base`, not of any per-project image. Offline, bach falls back to
+  the newest cached version.
 - **Per-project image**: when `.bach.toml` has `apt_packages`, bach generates a
   tiny `FROM bach:base` Dockerfile and tags `bach-proj:<hash>`. Hash includes
   the base image's digest, so a rebuilt base auto-invalidates project images.
@@ -263,6 +274,7 @@ etc.) avoid running updates from two sessions concurrently.
 
 ```
 ~/.local/share/bach/cache/mise/                # shared mise tool cache
+~/.local/share/bach/cache/claude/              # cached claude binaries (auto-updated)
 ~/.local/share/bach/cache/projects/<proj>/     # per-project [[cache]] data
 ~/.local/share/bach/projects/<proj>/           # per-project claude history
 ~/.local/state/bach/runtime/                   # 0700 staged secrets + [[stage]]
@@ -273,7 +285,8 @@ etc.) avoid running updates from two sessions concurrently.
 
 ```
 bach              # Python 3 CLI (single file, stdlib only). Symlink to ~/.local/bin/bach.
-Dockerfile        # bach:base. Debian trixie-slim + claude + mise + entrypoint.
+Dockerfile        # bach:base. Debian trixie-slim + mise + entrypoint (claude
+                  # is mounted in from the host-side binary cache, not baked in).
 entrypoint.sh     # Runs as root: seeds ~/.claude, applies [[stage]],
                   # [[cache]] warm/promote, then runuser to agent.
 bach-rcfile       # Sourced by `bash --rcfile -i` when `bach c` runs claude
