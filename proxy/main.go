@@ -793,6 +793,12 @@ var csrfToken = func() string {
 	return hex.EncodeToString(b)
 }()
 
+func handleServiceWorker(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write([]byte(serviceWorkerJS))
+}
+
 func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	host, port, err := net.SplitHostPort(r.Host)
@@ -1180,6 +1186,7 @@ func main() {
 
 	dashMux := http.NewServeMux()
 	dashMux.HandleFunc("/", handleDashboard)
+	dashMux.HandleFunc("/sw.js", handleServiceWorker)
 	dashMux.HandleFunc("/events", handleSSE)
 	dashMux.HandleFunc("/csrf", handleCsrf)
 	dashMux.HandleFunc("/approve", handleApprove)
@@ -1216,6 +1223,50 @@ func cidrStrings(nets []*net.IPNet) []string {
 	}
 	return out
 }
+
+const serviceWorkerJS = `
+var bc = new BroadcastChannel("bach-proxy");
+
+bc.onmessage = function(e) {
+  var msg = e.data;
+  if (msg.type !== "pending") return;
+  self.registration.showNotification("Allow " + msg.host + "?", {
+    body: "project: " + msg.project,
+    tag: msg.project + "|" + msg.host,
+    renotify: true,
+    requireInteraction: true,
+    actions: [{ action: "allow", title: "Allow" }],
+    data: { project: msg.project, host: msg.host, csrfToken: msg.csrfToken }
+  });
+};
+
+self.addEventListener("notificationclick", function(e) {
+  e.notification.close();
+  if (e.action === "allow") {
+    var d = e.notification.data;
+    e.waitUntil(
+      fetch("/csrf")
+        .then(function(r) { return r.ok ? r.text() : d.csrfToken; })
+        .catch(function() { return d.csrfToken; })
+        .then(function(token) {
+          return fetch(
+            "/approve?project=" + encodeURIComponent(d.project) + "&host=" + encodeURIComponent(d.host),
+            { method: "POST", headers: { "X-CSRF-Token": token } }
+          );
+        })
+    );
+  } else {
+    e.waitUntil(
+      clients.matchAll({ type: "window", includeUncontrolled: true }).then(function(list) {
+        for (var i = 0; i < list.length; i++) {
+          if ("focus" in list[i]) { list[i].focus(); return; }
+        }
+        return clients.openWindow("/");
+      })
+    );
+  }
+});
+`
 
 const dashboardHTML = `<!DOCTYPE html>
 <html lang="en">
@@ -1542,6 +1593,11 @@ const dashboardHTML = `<!DOCTYPE html>
   }
   footer a { color: var(--text-dim); text-decoration: none; }
   footer a:hover { color: var(--text-mute); }
+  /* notification toggle */
+  #notif-btn { font-size: 11px; padding: 4px 11px; letter-spacing: 0.1em; }
+  #notif-btn.on { color: var(--accent); border-color: rgba(184,237,90,0.35); }
+  #notif-btn:disabled { opacity: 0.38; cursor: default; pointer-events: none; }
+  .header-right { display: flex; align-items: center; gap: 16px; }
 </style>
 </head>
 <body>
@@ -1549,7 +1605,10 @@ const dashboardHTML = `<!DOCTYPE html>
   <div class="brand">
     <span class="mark">bach<span class="accent">.</span></span>
   </div>
-  <span class="live" id="live"><span class="dot"></span>live</span>
+  <div class="header-right">
+    <button class="btn" id="notif-btn" style="display:none">enable notifs</button>
+    <span class="live" id="live"><span class="dot"></span>live</span>
+  </div>
 </header>
 
 <section>
@@ -1621,6 +1680,55 @@ const dashboardHTML = `<!DOCTYPE html>
   };
 
   var csrfToken = document.querySelector('meta[name="csrf-token"]').content;
+
+  // --- browser notifications via service worker ---
+  var notifBC = null;
+  var notifBtn = document.getElementById("notif-btn");
+
+  function notifSupported() {
+    return "serviceWorker" in navigator && "Notification" in window && "BroadcastChannel" in window;
+  }
+
+  function syncNotifBtn() {
+    if (!notifBtn || !notifSupported()) return;
+    notifBtn.style.display = "";
+    var perm = Notification.permission;
+    if (perm === "granted") {
+      notifBtn.textContent = "notifs on";
+      notifBtn.classList.add("on");
+      notifBtn.disabled = false;
+    } else if (perm === "denied") {
+      notifBtn.textContent = "notifs blocked";
+      notifBtn.classList.remove("on");
+      notifBtn.disabled = true;
+    } else {
+      notifBtn.textContent = "enable notifs";
+      notifBtn.classList.remove("on");
+      notifBtn.disabled = false;
+    }
+  }
+
+  function openNotifChannel() {
+    if (notifBC) return;
+    notifBC = new BroadcastChannel("bach-proxy");
+  }
+
+  if (notifSupported()) {
+    navigator.serviceWorker.register("/sw.js").then(function() {
+      if (Notification.permission === "granted") openNotifChannel();
+    }).catch(function(err) {
+      console.warn("bach-proxy sw:", err);
+    });
+    syncNotifBtn();
+  }
+
+  notifBtn && notifBtn.addEventListener("click", function() {
+    Notification.requestPermission().then(function(perm) {
+      if (perm === "granted") openNotifChannel();
+      syncNotifBtn();
+    });
+  });
+  // --- end notifications ---
 
   var hosts = {};
   var tempExpiry = {};
@@ -1721,6 +1829,9 @@ const dashboardHTML = `<!DOCTYPE html>
       h.latestStatus = "pending";
       if (!h.pendingIDs) h.pendingIDs = {};
       h.pendingIDs[ev.id] = true;
+      if (notifBC && Notification.permission === "granted") {
+        notifBC.postMessage({ type: "pending", project: ev.project || "?", host: ev.host, id: ev.id, csrfToken: csrfToken });
+      }
     } else if (ev.id && h.pendingIDs && h.pendingIDs[ev.id]) {
       delete h.pendingIDs[ev.id];
       h.pendingCount--;
